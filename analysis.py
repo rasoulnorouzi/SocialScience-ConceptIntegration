@@ -1,7 +1,6 @@
 import pandas as pd
 import numpy as np
-from sentence_transformers import SentenceTransformer
-from sklearn.model_selection import KFold
+from sentence_transformers import SentenceTransformer, models
 from sklearn.metrics import precision_score, recall_score, f1_score
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -42,7 +41,7 @@ df['term2'] = df['term2'].astype(str)
 labels = df['label'].values
 
 # Models to evaluate
-models_to_test = ['all-mpnet-base-v2', 'dwulff/mpnet-personality']
+models_to_test = ['all-mpnet-base-v2', 'dwulff/mpnet-personality', 'allenai/scibert_scivocab_uncased', 'bert-base-uncased']
 all_summary_data = []
 
 for model_name in models_to_test:
@@ -53,7 +52,12 @@ for model_name in models_to_test:
     # 3. Model & Encoding
     print(f"Loading Model ({model_name})...")
     try:
-        model = SentenceTransformer(model_name)
+        if model_name in ['allenai/scibert_scivocab_uncased', 'bert-base-uncased']:
+            word_embedding_model = models.Transformer(model_name)
+            pooling_model = models.Pooling(word_embedding_model.get_word_embedding_dimension(), pooling_mode='mean')
+            model = SentenceTransformer(modules=[word_embedding_model, pooling_model])
+        else:
+            model = SentenceTransformer(model_name)
     except Exception as e:
         print(f"Failed to load {model_name}: {e}")
         continue
@@ -66,44 +70,14 @@ for model_name in models_to_test:
     print("Computing Cosine Similarities...")
     similarities = torch.nn.functional.cosine_similarity(embeddings1, embeddings2).cpu().numpy()
 
-    # 5. Cross Validation & Threshold Optimization
-    print("Starting 5-Fold Cross Validation...")
-    kf = KFold(n_splits=5, shuffle=True, random_state=SEED)
+    # 5. Threshold Optimization
+    print("Starting Threshold Optimization...")
     thresholds = np.arange(0.10, 1.00, 0.01)
-
-    fold_metrics = {t: {'precision': [], 'recall': [], 'f1': [], 'pos_acc': [], 'neg_acc': []} for t in thresholds}
-
-    # Execute CV
-    for fold, (train_idx, val_idx) in enumerate(kf.split(similarities)):
-        # print(f"Processing Fold {fold + 1}/5...")
-        val_sims = similarities[val_idx]
-        val_labels = labels[val_idx]
-        
-        for t in thresholds:
-            preds = (val_sims > t).astype(int)
-            
-            # Calculate metrics
-            p = precision_score(val_labels, preds, zero_division=0)
-            r = recall_score(val_labels, preds, zero_division=0)
-            f1 = f1_score(val_labels, preds, zero_division=0)
-            
-            # Class-specific accuracy
-            pos_mask = (val_labels == 1)
-            neg_mask = (val_labels == 0)
-            
-            pos_acc = np.mean(preds[pos_mask] == 1) if np.any(pos_mask) else 0.0
-            neg_acc = np.mean(preds[neg_mask] == 0) if np.any(neg_mask) else 0.0
-
-            fold_metrics[t]['precision'].append(p)
-            fold_metrics[t]['recall'].append(r)
-            fold_metrics[t]['f1'].append(f1)
-            fold_metrics[t]['pos_acc'].append(pos_acc)
-            fold_metrics[t]['neg_acc'].append(neg_acc)
 
     # 6. Aggregating
     print(f"\n--- Results per Threshold ({model_name}) ---")
-    print(f"{'Threshold':<10} | {'F1 (Mean)':<10} | {'F1 (Var)':<10} | {'Prec (Mean)':<10} | {'Rec (Mean)':<10} | {'PosAcc':<10} | {'NegAcc':<10}")
-    print("-" * 90)
+    print(f"{'Threshold':<10} | {'F1':<10} | {'Precision':<10} | {'Recall':<10} | {'PosAcc':<10} | {'NegAcc':<10}")
+    print("-" * 80)
 
     current_model_results = []
     
@@ -112,37 +86,38 @@ for model_name in models_to_test:
     best_threshold_model = -1
     
     for t in thresholds:
-        # Aggregating
-        avg_p = np.mean(fold_metrics[t]['precision'])
-        var_p = np.var(fold_metrics[t]['precision'])
+        preds = (similarities > t).astype(int)
         
-        avg_r = np.mean(fold_metrics[t]['recall'])
-        var_r = np.var(fold_metrics[t]['recall'])
+        # Calculate metrics
+        p = precision_score(labels, preds, zero_division=0)
+        r = recall_score(labels, preds, zero_division=0)
+        f1 = f1_score(labels, preds, zero_division=0)
         
-        avg_f1 = np.mean(fold_metrics[t]['f1'])
-        var_f1 = np.var(fold_metrics[t]['f1'])
+        # Class-specific accuracy
+        pos_mask = (labels == 1)
+        neg_mask = (labels == 0)
+        
+        pos_acc = np.mean(preds[pos_mask] == 1) if np.any(pos_mask) else 0.0
+        neg_acc = np.mean(preds[neg_mask] == 0) if np.any(neg_mask) else 0.0
 
-        avg_pos = np.mean(fold_metrics[t]['pos_acc'])
-        avg_neg = np.mean(fold_metrics[t]['neg_acc'])
-        
         # Update specific model best
-        if avg_f1 > best_f1_model:
-            best_f1_model = avg_f1
+        if f1 > best_f1_model:
+            best_f1_model = f1
             best_threshold_model = t
         
         result_entry = {
             'model': model_name,
             'threshold': t,
-            'precision_mean': avg_p, 'precision_var': var_p,
-            'recall_mean': avg_r, 'recall_var': var_r,
-            'f1_mean': avg_f1, 'f1_var': var_f1,
-            'pos_acc_mean': avg_pos,
-            'neg_acc_mean': avg_neg
+            'precision_mean': p, 'precision_var': 0.0,
+            'recall_mean': r, 'recall_var': 0.0,
+            'f1_mean': f1, 'f1_var': 0.0,
+            'pos_acc_mean': pos_acc,
+            'neg_acc_mean': neg_acc
         }
         all_summary_data.append(result_entry)
         current_model_results.append(result_entry)
         
-        print(f"{t:.2f}       | {avg_f1:.4f}     | {var_f1:.4f}     | {avg_p:.4f}     | {avg_r:.4f}     | {avg_pos:.4f}     | {avg_neg:.4f}")
+        print(f"{t:.2f}       | {f1:.4f}     | {p:.4f}     | {r:.4f}     | {pos_acc:.4f}     | {neg_acc:.4f}")
 
     # Generate Individual Plot
     print(f"Generating plot for {model_name}...")
